@@ -39,6 +39,7 @@ from scapy.all import (  # type: ignore
     send,
     sendp,
     sniff,
+    sr1,
     srp1,
     srp,
 )
@@ -56,6 +57,8 @@ __all__ = [
     "get_default_gateway",
     "enable_ip_forward",
     "disable_ip_forward",
+    "probe_device",
+    "probe_multicast",
 ]
 
 WINDOWS = os.name == "nt"
@@ -155,6 +158,8 @@ def _ps(cmd: str, timeout: float = 8) -> str:
             stdin=subprocess.DEVNULL,
             capture_output=True,
             text=True,
+            encoding="mbcs" if WINDOWS else None,  # 中文 Windows 输出是 GBK
+            errors="ignore",
             timeout=timeout,
             creationflags=flags,
         )
@@ -517,17 +522,66 @@ _OUI: Dict[str, str] = {
     "00:04:20": "Slim Devices", "00:1F:3A": "Ruckus", "C4:01:7C": "Ruckus",
 }
 _OUI_CACHE: Dict[str, str] = {}
+# IEEE 官方 OUI 数据库（首次使用时下载并缓存，覆盖全厂商）
+_OUI_DB: Dict[str, str] = {}
+_OUI_DB_PATH = os.path.join(os.path.expanduser("~"), ".netkill", "oui.csv")
+_OUI_DB_STATE = {"loaded": False}
+_OUI_DB_URL = "https://standards-oui.ieee.org/oui/oui.csv"
+
+
+def _load_oui_db(block: bool = True) -> None:
+    """加载 IEEE OUI 厂商库（本地缓存优先，没有则联网下载一次）。"""
+    if _OUI_DB_STATE["loaded"]:
+        return
+    if not block:
+        return
+    _OUI_DB_STATE["loaded"] = True
+    try:
+        if not os.path.exists(_OUI_DB_PATH) or os.path.getsize(_OUI_DB_PATH) < 10000:
+            os.makedirs(os.path.dirname(_OUI_DB_PATH), exist_ok=True)
+            import urllib.request
+            ua = {"User-Agent": "Mozilla/5.0 (Windows NT 10.0; Win64; x64) "
+                                "AppleWebKit/537.36 (KHTML, like Gecko) Chrome/120 Safari/537.36"}
+            req = urllib.request.Request(_OUI_DB_URL, headers=ua)
+            with urllib.request.urlopen(req, timeout=40) as r:
+                data = r.read()
+            if data and len(data) > 10000:
+                with open(_OUI_DB_PATH, "wb") as f:
+                    f.write(data)
+        with open(_OUI_DB_PATH, "r", encoding="utf-8", errors="ignore") as f:
+            for line in f:
+                parts = line.split(",")
+                if len(parts) < 3:
+                    continue
+                assign = parts[1].strip().strip('"').upper()
+                name = parts[2].strip().strip('"')
+                if len(assign) == 6 and assign.isalnum():
+                    key = ":".join(assign[i:i + 2] for i in range(0, 6, 2))
+                    if name:
+                        _OUI_DB[key] = name
+    except Exception:
+        pass
 
 
 def _vendor(mac: str) -> str:
-    """按 OUI 查厂商（本地库，毫秒级）。"""
+    """按 OUI 查厂商：先查 IEEE 全库，再回退内置常见表。"""
     mac = _norm_mac(mac)
     key = mac[:8].upper()
     if key in _OUI_CACHE:
         return _OUI_CACHE[key]
-    name = _OUI.get(key, "")
+    name = _OUI_DB.get(key, "")
+    if not name:
+        _load_oui_db(block=True)
+        name = _OUI_DB.get(key, "")
+    if not name:
+        name = _OUI.get(key, "")
     _OUI_CACHE[key] = name
     return name
+
+
+def preload_oui_db() -> None:
+    """后台预热 OUI 库（GUI 启动时调用，避免首次查询卡顿）。"""
+    threading.Thread(target=lambda: _load_oui_db(block=True), daemon=True).start()
 
 
 # --------------------------------------------------------------------------- #
@@ -647,6 +701,28 @@ class ArpKiller:
                     devices[parts[0]] = Device(ip=parts[0], mac=_norm_mac(parts[4]),
                                                vendor=_vendor(parts[4]),
                                                state=parts[-1] if parts else "")
+        # 兜底：Get-NetNeighbor 不可用时改用系统 arp -a 表
+        if WINDOWS and not devices:
+            try:
+                import re as _re
+                raw = _ps("arp -a")
+                cur_ok = False
+                for line in raw.splitlines():
+                    if "接口" in line or "Interface" in line:
+                        cur_ok = self.adapter.ip in line
+                        continue
+                    m = _re.match(
+                        r"\s*(\d+\.\d+\.\d+\.\d+)\s+([0-9a-fA-F]{2}(?:[-:][0-9a-fA-F]{2}){5})\s+",
+                        line,
+                    )
+                    if m and cur_ok:
+                        ip, mac = m.group(1), _norm_mac(m.group(2))
+                        if ip == self.adapter.ip:
+                            continue
+                        devices[ip] = Device(ip=ip, mac=mac, vendor=_vendor(mac),
+                                             last_seen=time.time(), state="arp")
+            except Exception:
+                pass
         self_mac = _norm_mac(self.adapter.mac)
         gw_mac = ""
         if self.gateway and self.gateway in devices:
@@ -660,21 +736,28 @@ class ArpKiller:
                 d.hostname = ""   # 不做在线 DNS 反查，避免 Windows 上每台卡数秒
             if gw_mac and d.ip != self.gateway and d.mac.lower() == gw_mac:
                 d.is_proxy_arp = True
+                # 代理 MAC 的厂商其实是网关厂商，不能代表这台设备
+                d.vendor = ""
         self.log(f"邻居表只读扫描：{len(devices)} 台（未发送任何数据包）。")
         return sorted(devices.values(), key=lambda x: ipaddress.IPv4Address(x.ip))
 
     def scan(self, cidr: Optional[str] = None, timeout: float = 2.0) -> List[Device]:
-        """ARP 扫描整个网段，找出所有在线设备（含室友电脑/手机）。"""
+        """ARP 扫描整个网段，找出所有在线设备（含室友电脑/手机）。
+
+        注意：/16 这类大网段（6.5 万个地址）扫描极慢且会刷爆网络，
+        这里自动收敛到「本机 /24」，保证几秒内完成。
+        """
         if not cidr:
             try:
-                cidr = str(
-                    ipaddress.IPv4Network(
-                        f"{self.adapter.ip}/{self._prefix()}", strict=False
-                    )
+                net = ipaddress.IPv4Network(
+                    f"{self.adapter.ip}/{self._prefix()}", strict=False
                 )
+                if net.prefixlen < 24:      # 大网段收敛到 /24
+                    net = ipaddress.IPv4Network(f"{self.adapter.ip}/24", strict=False)
+                cidr = str(net)
             except Exception:
                 cidr = f"{self.adapter.ip}/24"
-        self.log(f"ARP 扫描网段 {cidr} …（约 {timeout:g}s）")
+        self.log(f"ARP 扫描网段 {cidr} …（最长 {timeout:g}s）")
         try:
             ans, _ = srp(
                 Ether(dst="ff:ff:ff:ff:ff:ff")
@@ -871,6 +954,304 @@ class ArpKiller:
     def sent(self) -> int:
         with self._lock:
             return self._sent
+
+
+# --------------------------------------------------------------------------- #
+# 目标连通性探测（断网时判断对方是否还有网络）
+# --------------------------------------------------------------------------- #
+def probe_device(adapter: "Adapter", ip: str, timeout: float = 0.8,
+                 ports: Tuple[int, ...] = (80, 443, 22, 445)) -> Dict:
+    """三层探测：ARP 在线 / ICMP 可达 / TCP 端口响应（并发执行，总耗时约 1~2 秒）。
+
+    返回 dict：
+      arp_mac   : 有回应时目标 MAC（说明对方在线、二层可达）
+      icmp_ok   : ping 是否通
+      tcp       : {port: "open"/"closed"}，只含收到回应的端口
+      responded : 是否有任何回应
+      error     : 探测过程中的错误（如有）
+    """
+    from concurrent.futures import ThreadPoolExecutor
+
+    res: Dict = {"ip": ip, "arp_mac": None, "icmp_ok": False,
+                 "tcp": {}, "responded": False, "error": ""}
+    iface = adapter.device
+
+    def _arp():
+        try:
+            ans = srp1(
+                Ether(dst="ff:ff:ff:ff:ff:ff") / ARP(pdst=ip),
+                iface=iface, timeout=timeout, verbose=0,
+            )
+            return _norm_mac(ans.hwsrc) if ans is not None else None
+        except Exception as e:
+            return ("ERR", str(e))
+
+    def _icmp():
+        try:
+            return sr1(IP(dst=ip) / ICMP(), timeout=timeout, verbose=0) is not None
+        except Exception:
+            return False
+
+    def _tcp(port):
+        try:
+            p = sr1(IP(dst=ip) / TCP(dport=port, flags="S"),
+                    timeout=timeout, verbose=0)
+            if p is not None and p.haslayer(TCP):
+                return "open" if (int(p[TCP].flags) & 0x12) == 0x12 else "closed"
+        except Exception:
+            pass
+        return None
+
+    with ThreadPoolExecutor(max_workers=2 + len(ports)) as ex:
+        f_arp = ex.submit(_arp)
+        f_icmp = ex.submit(_icmp)
+        f_tcp = {p: ex.submit(_tcp, p) for p in ports}
+        try:
+            v = f_arp.result(timeout=timeout + 1.5)
+            if isinstance(v, tuple) and v and v[0] == "ERR":
+                res["error"] = f"ARP: {v[1]}"
+            else:
+                res["arp_mac"] = v
+        except Exception:
+            pass
+        try:
+            res["icmp_ok"] = bool(f_icmp.result(timeout=timeout + 1.5))
+        except Exception:
+            pass
+        for port, fut in f_tcp.items():
+            try:
+                st = fut.result(timeout=timeout + 1.5)
+            except Exception:
+                st = None
+            if st:
+                res["tcp"][port] = st
+    res["responded"] = bool(res["arp_mac"] or res["icmp_ok"] or res["tcp"])
+    return res
+
+
+# --------------------------------------------------------------------------- #
+# 组播 / 广播探测（穿透客户端隔离）
+# --------------------------------------------------------------------------- #
+_SSDP_REQ = (
+    b"M-SEARCH * HTTP/1.1\r\n"
+    b"HOST: 239.255.255.250:1900\r\n"
+    b"MAN: \"ssdp:discover\"\r\n"
+    b"MX: 2\r\n"
+    b"ST: ssdp:all\r\n\r\n"
+)
+
+
+def _build_multicast_probes(adapter: "Adapter") -> list:
+    """构造 SSDP / mDNS / NetBIOS / LLMNR / 广播 ICMP 探测包。
+
+    依据：客户端隔离通常只过滤「客户端间单播」，广播与组播照常转发，
+    因此用组播协议做发现可以绕过一部分隔离实现。
+    """
+    from scapy.layers.dns import DNS, DNSQR
+    from scapy.layers.netbios import NBNSQueryRequest
+
+    probes = []
+    try:
+        probes.append(
+            Ether(dst="01:00:5e:7f:ff:fa") / IP(dst="239.255.255.250", ttl=4)
+            / UDP(sport=1900, dport=1900) / _SSDP_REQ
+        )
+    except Exception:
+        pass
+    try:
+        probes.append(
+            Ether(dst="01:00:5e:00:00:fb") / IP(dst="224.0.0.251", ttl=255)
+            / UDP(sport=5353, dport=5353)
+            / DNS(id=0, qr=0, qd=DNSQR(qname="_services._dns-sd._udp.local", qtype="PTR"))
+        )
+    except Exception:
+        pass
+    try:
+        probes.append(
+            Ether(dst="ff:ff:ff:ff:ff:ff") / IP(dst="255.255.255.255", ttl=1)
+            / UDP(sport=137, dport=137)
+            / NBNSQueryRequest(NAME_TRN_ID=random.randint(0x1000, 0xFFFF),
+                               QUESTION_NAME="*", QUESTION_TYPE="NBSTAT")
+        )
+    except Exception:
+        pass
+    try:
+        probes.append(
+            Ether(dst="01:00:5e:00:00:fc") / IP(dst="224.0.0.252", ttl=1)
+            / UDP(sport=5355, dport=5355)
+            / DNS(id=1, qr=0, qd=DNSQR(qname="localhost", qtype="A"))
+        )
+    except Exception:
+        pass
+    try:
+        probes.append(
+            Ether(dst="ff:ff:ff:ff:ff:ff")
+            / IP(dst="255.255.255.255") / ICMP()
+        )
+    except Exception:
+        pass
+    return probes
+
+
+_SERVICE_HINTS = {
+    "_companion-link": "Apple 设备（iPhone/iPad/Mac）",
+    "_device-info": "Apple 设备",
+    "_airplay": "Apple 投屏设备",
+    "_raop": "AirPlay 音频设备",
+    "_googlecast": "Chromecast/电视",
+    "_hap": "HomeKit 智能设备",
+    "_miio": "小米智能设备",
+    "_smb": "文件共享设备",
+    "_workstation": "Windows 电脑",
+    "_ipp": "网络打印机",
+    "_printer": "网络打印机",
+    "_spotify-connect": "Spotify 设备",
+    "_ssh": "SSH 设备（Linux/Mac）",
+    "_sftp-ssh": "SSH 设备",
+    "_http": "Web 设备",
+    "_rdlink": "远程桌面设备",
+}
+
+
+def _device_hint(info: str, proto: str = "") -> str:
+    """根据 mDNS 服务名 / 主机名推断设备类型，帮助识别是哪台设备。"""
+    low = (info or "").lower()
+    for key, name in _SERVICE_HINTS.items():
+        if key in low:
+            return name
+    if "desktop-" in low or "laptop-" in low:
+        return "Windows 电脑"
+    if "android" in low:
+        return "Android 设备"
+    if "iphone" in low or "ipad" in low or "macbook" in low:
+        return "Apple 设备"
+    if "printer" in low or "hp-" in low or "epson" in low:
+        return "打印机"
+    if "tv" in low or "cast" in low or "roku" in low:
+        return "电视/投屏"
+    if "server" in low:
+        return "服务器"
+    return ""
+
+
+def probe_multicast(adapter: "Adapter", timeout: float = 3.0) -> List[Dict]:
+    """发组播/广播探测并收集响应，返回发现的设备列表。
+
+    每条：{ip, mac, proto, info, vendor, hint}
+    """
+    from scapy.layers.dns import DNS
+    from scapy.layers.netbios import NBNSHeader, NBNSNodeStatusResponse
+
+    probes = _build_multicast_probes(adapter)
+    found: Dict[str, Dict] = {}
+    if not probes:
+        return []
+
+    def _on_pkt(p) -> None:
+        try:
+            if not p.haslayer("IP"):
+                return
+            src = p["IP"].src
+            if src.startswith(("127.", "0.")) or src == adapter.ip:
+                return
+            # 只保留局域网内响应（/16 覆盖校园网，/24 覆盖家用网）
+            try:
+                ip_obj = ipaddress.IPv4Address(src)
+                lan16 = ipaddress.IPv4Network(f"{adapter.ip}/16", strict=False)
+                lan24 = ipaddress.IPv4Network(f"{adapter.ip}/24", strict=False)
+                if not (ip_obj in lan16 or ip_obj in lan24):
+                    return
+            except Exception:
+                return
+            proto = ""
+            info = ""
+            if p.haslayer("UDP"):
+                dport = int(p["UDP"].sport)
+                if dport == 1900:
+                    proto = "SSDP"
+                    raw = bytes(p["UDP"].payload)
+                    for key in (b"SERVER:", b"ST:", b"USN:", b"LOCATION:"):
+                        idx = raw.find(key)
+                        if idx >= 0:
+                            seg = raw[idx:idx + 120].split(b"\r\n")[0].decode(
+                                "utf-8", "ignore"
+                            )
+                            info = (info + " " + seg).strip()
+                elif dport == 5353:
+                    proto = "mDNS"
+                    if p.haslayer(DNS):
+                        dns = p[DNS]
+                        names = []
+                        try:
+                            for i in range(int(dns.ancount or 0)):
+                                rr = dns[i]
+                                for attr in ("rrname", "rdata"):
+                                    v = getattr(rr, attr, None)
+                                    if isinstance(v, bytes):
+                                        v = v.decode("utf-8", "ignore")
+                                    if isinstance(v, str) and v:
+                                        names.append(v.rstrip("."))
+                        except Exception:
+                            pass
+                        if names:
+                            info = names[0]
+                            # 优先取服务类型名（_airplay._tcp.local 等），便于识别设备
+                            for n in names:
+                                if "._tcp" in n or "._udp" in n:
+                                    info = n
+                                    break
+                elif dport == 137:
+                    proto = "NetBIOS"
+                    try:
+                        # NetBIOS 节点状态响应里带计算机名（如 DESKTOP-ABC）
+                        import re as _re
+                        raw = bytes(p["UDP"].payload)
+                        cands = _re.findall(rb"[A-Z][A-Z0-9\-_]{2,14}", raw)
+                        for c in cands:
+                            s = c.decode("ascii", "ignore").strip()
+                            # 只接受带分隔符的典型计算机名，过滤随机字节串
+                            if len(s) >= 4 and ("-" in s or "_" in s):
+                                info = s
+                                break
+                    except Exception:
+                        pass
+                elif dport == 5355:
+                    proto = "LLMNR"
+                else:
+                    proto = f"UDP:{dport}"
+            elif p.haslayer("ICMP"):
+                if int(p["ICMP"].type) == 0:      # echo reply
+                    proto = "ICMP"
+            if not proto:
+                return
+            mac = _norm_mac(p["Ether"].src) if p.haslayer("Ether") else ""
+            dev = found.setdefault(src, {"ip": src, "mac": mac,
+                                         "proto": set(), "info": "",
+                                         "vendor": _vendor(mac) if mac else ""})
+            dev["proto"].add(proto)
+            if mac and not dev.get("vendor"):
+                dev["vendor"] = _vendor(mac)
+            if info and not dev["info"]:
+                dev["info"] = info
+            if mac and not dev["mac"]:
+                dev["mac"] = mac
+        except Exception:
+            pass
+
+    try:
+        sendp(probes, iface=adapter.device, verbose=0, inter=0.05)
+        sniff(iface=adapter.device, timeout=timeout, store=False,
+              prn=_on_pkt, lfilter=lambda x: x.haslayer("IP"))
+    except Exception:
+        pass
+
+    out = []
+    for d in found.values():
+        d["proto"] = ",".join(sorted(d["proto"]))
+        d["hint"] = _device_hint(d.get("info", ""), d["proto"])
+        out.append(d)
+    out.sort(key=lambda x: ipaddress.IPv4Address(x["ip"]))
+    return out
 
 
 # --------------------------------------------------------------------------- #
