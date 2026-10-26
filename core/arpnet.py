@@ -370,6 +370,8 @@ class Device:
     vendor: str = ""
     last_seen: float = 0.0
     online: bool = True
+    state: str = ""            # 邻居表状态：Reachable / Stale / Delay / Probe ...
+    is_proxy_arp: bool = False # MAC 与网关相同（代理ARP/客户端隔离网络）
 
     @property
     def label(self) -> str:
@@ -380,38 +382,152 @@ class Device:
         return self.label
 
 
-def _hostname(ip: str, timeout: float = 0.6) -> str:
+def _hostname(ip: str, timeout: float = 0.8) -> str:
+    """反向 DNS 解析主机名（失败返回空，绝不阻塞过久）。"""
+    old = socket.getdefaulttimeout()
     try:
         socket.setdefaulttimeout(timeout)
         name = socket.gethostbyaddr(ip)[0]
         return name.split(".")[0]
     except Exception:
         return ""
+    finally:
+        try:
+            socket.setdefaulttimeout(old)
+        except Exception:
+            pass
+
+
+def resolve_hostnames(devices: List["Device"], workers: int = 8,
+                      timeout: float = 0.8) -> None:
+    """并发解析主机名并写回 device.hostname（供界面后台调用）。"""
+    pend = [d for d in devices if not d.hostname]
+    if not pend:
+        return
+    from concurrent.futures import ThreadPoolExecutor
+
+    with ThreadPoolExecutor(max_workers=max(1, min(workers, len(pend)))) as ex:
+        futs = {ex.submit(_hostname, d.ip, timeout): d for d in pend}
+        for fut, d in futs.items():
+            try:
+                name = fut.result(timeout=timeout + 1.0)
+            except Exception:
+                name = ""
+            if name:
+                d.hostname = name
+
+
+# OUI 厂商表（本地常见品牌库，覆盖手机/电脑/路由器/虚拟机）
+_OUI: Dict[str, str] = {
+    # Apple
+    "AC:BC:32": "Apple", "F0:18:98": "Apple", "A4:83:E7": "Apple", "3C:22:FB": "Apple",
+    "14:7D:DA": "Apple", "9C:FC:01": "Apple", "00:1B:44": "Apple", "F4:0F:24": "Apple",
+    "D0:81:7A": "Apple", "6C:40:08": "Apple", "84:38:35": "Apple", "F8:FF:C2": "Apple",
+    "E0:B9:BA": "Apple", "A8:88:08": "Apple", "54:26:96": "Apple", "7C:D1:C3": "Apple",
+    "90:B0:ED": "Apple", "04:D3:CF": "Apple", "7C:04:D0": "Apple", "5C:F9:38": "Apple",
+    "6C:70:9F": "Apple", "F0:99:BF": "Apple", "DC:2C:6E": "Apple", "70:3E:AC": "Apple",
+    # Samsung
+    "70:3A:CB": "Samsung", "E8:50:8B": "Samsung", "38:AA:3C": "Samsung", "5C:0A:5B": "Samsung",
+    "04:18:D6": "Samsung", "08:37:3D": "Samsung", "28:39:5E": "Samsung", "2C:AE:2B": "Samsung",
+    "34:23:BA": "Samsung", "4C:3C:16": "Samsung", "50:32:37": "Samsung", "78:1F:DB": "Samsung",
+    "8C:77:12": "Samsung", "A0:21:95": "Samsung", "C8:19:F7": "Samsung", "D8:57:EF": "Samsung",
+    "EC:1F:72": "Samsung", "F4:09:D8": "Samsung", "84:25:DB": "Samsung",
+    # Huawei
+    "1C:1B:0D": "Huawei", "48:DB:50": "Huawei", "C8:94:BB": "Huawei", "E0:24:7F": "Huawei",
+    "24:09:95": "Huawei", "00:E0:FC": "Huawei", "28:3C:E4": "Huawei", "34:6B:D3": "Huawei",
+    "4C:1F:CC": "Huawei", "54:25:EA": "Huawei", "6C:92:BF": "Huawei", "70:72:3C": "Huawei",
+    "8C:34:FD": "Huawei", "A0:8C:F8": "Huawei", "AC:E2:15": "Huawei", "B8:43:E4": "Huawei",
+    "C0:70:09": "Huawei", "D0:7A:B5": "Huawei", "DC:D2:FC": "Huawei", "E4:A7:C5": "Huawei",
+    "F4:9F:54": "Huawei", "30:0E:B8": "Huawei",
+    # Xiaomi / Redmi
+    "3C:7C:3F": "Xiaomi", "64:CC:2E": "Xiaomi", "50:8F:4C": "Xiaomi", "78:11:DC": "Xiaomi",
+    "8C:BE:BE": "Xiaomi", "00:9E:C8": "Xiaomi", "F0:B4:29": "Xiaomi", "28:6C:07": "Xiaomi",
+    "34:CE:00": "Xiaomi", "38:A4:ED": "Xiaomi", "4C:49:E3": "Xiaomi", "5C:02:14": "Xiaomi",
+    "64:B4:73": "Xiaomi", "68:DF:DD": "Xiaomi", "7C:1D:D9": "Xiaomi", "8C:53:C3": "Xiaomi",
+    "98:FA:E3": "Xiaomi", "9C:99:A0": "Xiaomi", "A8:9C:ED": "Xiaomi", "C4:0B:CB": "Xiaomi",
+    "D4:97:0B": "Xiaomi", "F4:8B:32": "Xiaomi", "30:86:2D": "Xiaomi",
+    # OPPO / OnePlus / realme
+    "64:A2:F9": "OPPO", "28:D1:8F": "OPPO", "34:3D:C4": "OPPO", "4C:1A:3A": "OPPO",
+    "58:6B:14": "OPPO", "70:5D:CC": "OPPO", "88:6B:0F": "OPPO", "A4:50:46": "OPPO",
+    "B0:4E:26": "OPPO", "D8:9A:34": "OPPO", "E8:BB:A8": "OPPO", "F4:5E:AB": "OPPO",
+    "C0:EE:FB": "OnePlus", "94:65:2D": "OnePlus",
+    # vivo
+    "3C:A0:67": "vivo", "F4:8C:50": "vivo", "34:80:B3": "vivo", "4C:57:39": "vivo",
+    "5C:93:A2": "vivo", "70:8A:09": "vivo", "84:EB:18": "vivo", "98:E7:9B": "vivo",
+    "A0:3D:6F": "vivo", "C4:59:8B": "vivo", "D0:11:E5": "vivo", "E4:4F:29": "vivo",
+    # Google / Pixel
+    "00:1A:11": "Google", "3C:5A:B4": "Google", "F4:F5:D8": "Google", "54:60:09": "Google",
+    "A4:77:33": "Google", "94:EB:2C": "Google", "44:07:0B": "Google", "D8:6C:63": "Google",
+    # Intel
+    "D4:93:90": "Intel", "CE:12:70": "Intel", "8C:16:45": "Intel", "00:1B:21": "Intel",
+    "3C:97:0E": "Intel", "40:25:C2": "Intel", "48:51:B7": "Intel", "5C:5F:67": "Intel",
+    "7C:7A:91": "Intel", "84:3A:4B": "Intel", "A4:BB:6D": "Intel", "B4:6B:FC": "Intel",
+    "C8:58:C0": "Intel", "DC:41:5F": "Intel", "E4:A4:71": "Intel", "F8:63:3F": "Intel",
+    "34:13:E8": "Intel", "8C:8D:28": "Intel",
+    # Qualcomm / Broadcom / Realtek
+    "00:03:7F": "Qualcomm", "00:0E:35": "Intel", "00:10:18": "Broadcom",
+    "00:E0:4C": "Realtek", "52:54:00": "QEMU",
+    # 主板/笔记本
+    "00:14:22": "Dell", "00:1C:23": "Dell", "00:21:9B": "Dell", "18:03:73": "Dell",
+    "24:6E:96": "Dell", "3C:2C:30": "Dell", "44:A8:42": "Dell", "54:BF:64": "Dell",
+    "78:2B:CB": "Dell", "84:2B:2B": "Dell", "B0:83:FE": "Dell", "C8:1F:66": "Dell",
+    "D4:AE:52": "Dell", "F0:4D:A2": "Dell", "F8:BC:12": "Dell",
+    "00:1B:78": "HP", "00:21:5A": "HP", "00:23:7D": "HP", "2C:41:38": "HP",
+    "3C:D9:2B": "HP", "40:A8:F0": "HP", "6C:3B:E5": "HP", "94:57:A5": "HP",
+    "9C:B6:54": "HP", "A0:48:1C": "HP", "B4:99:BA": "HP", "C4:34:6B": "HP",
+    "D4:85:64": "HP", "E4:11:5B": "HP", "EC:B1:D7": "HP", "F4:CE:46": "HP",
+    "00:12:FE": "Lenovo", "00:1E:37": "Lenovo", "28:D2:44": "Lenovo", "3C:91:80": "Lenovo",
+    "54:EE:75": "Lenovo", "68:F7:28": "Lenovo", "80:FA:5B": "Lenovo", "98:FA:9B": "Lenovo",
+    "A0:8C:FD": "Lenovo", "C8:5B:76": "Lenovo", "E4:A7:A0": "Lenovo", "F0:76:1C": "Lenovo",
+    "00:1B:FC": "ASUS", "04:D4:C4": "ASUS", "08:60:6E": "ASUS", "10:BF:48": "ASUS",
+    "14:DD:A9": "ASUS", "2C:56:DC": "ASUS", "38:D5:47": "ASUS", "40:16:7E": "ASUS",
+    "50:46:5D": "ASUS", "60:45:CB": "ASUS", "70:4D:7B": "ASUS", "74:D0:2B": "ASUS",
+    "88:D7:F6": "ASUS", "AC:22:0B": "ASUS", "BC:AE:C5": "ASUS", "D8:50:E6": "ASUS",
+    "F4:6D:04": "ASUS",
+    # 路由器 / 网络设备
+    "48:8F:5A": "TP-Link", "50:C7:BF": "TP-Link", "60:32:B1": "TP-Link", "7C:8B:CA": "TP-Link",
+    "98:DA:C4": "TP-Link", "A4:2B:B0": "TP-Link", "C4:6E:1F": "TP-Link", "EC:08:6B": "TP-Link",
+    "F4:F2:6D": "TP-Link", "30:B5:C2": "TP-Link",
+    "48:8F:5A": "TP-Link",
+    "00:0C:43": "Ralink", "00:1F:A4": "Ralink", "C0:4A:00": "Ralink",
+    "B0:BE:76": "Tenda", "C8:3A:35": "Tenda", "50:2B:73": "Tenda", "D8:32:14": "Tenda",
+    "00:0D:0B": "Buffalo", "00:0F:66": "Cisco", "00:12:43": "Cisco", "00:1A:A1": "Cisco",
+    "F4:CF:E2": "Cisco", "50:DA:00": "Cisco",
+    "CC:32:E5": "Xiaomi", "7C:49:EB": "Xiaomi", "28:6C:07": "Xiaomi",
+    # 物联网 / 云 / 虚拟
+    "DC:A6:32": "RaspberryPi", "B8:27:EB": "RaspberryPi", "E4:5F:01": "RaspberryPi",
+    "28:CD:C1": "RaspberryPi",
+    "00:50:56": "VMware", "00:0C:29": "VMware", "00:05:69": "VMware", "00:1C:14": "VMware",
+    "08:00:27": "VirtualBox", "00:15:5D": "Hyper-V",
+    "B4:7C:9C": "Amazon", "74:C2:46": "Amazon", "44:65:0D": "Amazon", "50:DC:E7": "Amazon",
+    "68:37:E9": "Amazon", "84:D6:D0": "Amazon", "0C:47:C9": "Amazon", "18:74:2E": "Amazon",
+    "38:F7:3D": "Amazon", "40:B4:CD": "Amazon", "4C:17:44": "Amazon", "6C:56:97": "Amazon",
+    "74:75:48": "Amazon", "78:E1:03": "Amazon", "8C:85:90": "Amazon", "A0:02:DC": "Amazon",
+    "AC:63:BE": "Amazon", "F0:27:2D": "Amazon", "FC:65:DE": "Amazon",
+    "00:1C:62": "LG", "10:F9:6F": "LG", "2C:54:CF": "LG", "34:4D:F7": "LG",
+    "58:A2:B5": "LG", "7C:1C:4E": "LG", "A8:16:B2": "LG", "C4:36:6C": "LG",
+    "00:13:A9": "Sony", "30:F9:ED": "Sony", "54:42:49": "Sony", "78:84:3C": "Sony",
+    "A0:E4:53": "Sony", "FC:0F:E6": "Sony",
+    "00:09:BF": "Nintendo", "98:B6:E9": "Nintendo", "58:BD:A3": "Nintendo",
+    "00:0C:E5": "HTC", "3C:5B:8F": "HTC",
+    "00:1A:1B": "Motorola", "00:1C:56": "Motorola", "40:78:6A": "Motorola",
+    "00:24:54": "ASUSTek", "1C:B7:2C": "ASUSTek",
+    "00:1A:8C": "Nokia", "00:1F:5B": "Nokia", "3C:5A:B4": "Nokia",
+    "00:1E:65": "Intel", "00:22:FB": "Intel",
+    "00:04:20": "Slim Devices", "00:1F:3A": "Ruckus", "C4:01:7C": "Ruckus",
+}
+_OUI_CACHE: Dict[str, str] = {}
 
 
 def _vendor(mac: str) -> str:
-    """极简 OUI 识别，常见手机/电脑厂商。"""
-    table = {
-        "00:1A:11": "Google", "3C:5A:B4": "Google", "F4:F5:D8": "Google",
-        "DC:A6:32": "RaspberryPi", "B8:27:EB": "RaspberryPi",
-        "AC:BC:32": "Apple", "F0:18:98": "Apple", "A4:83:E7": "Apple",
-        "3C:22:FB": "Apple", "14:7D:DA": "Apple", "9C:FC:01": "Apple",
-        "00:1B:44": "Apple", "F4:0F:24": "Apple",
-        "D4:93:90": "Intel", "CE:12:70": "Intel", "8C:16:45": "Intel",
-        "3C:7C:3F": "Xiaomi", "64:CC:2E": "Xiaomi", "50:8F:4C": "Xiaomi",
-        "78:11:DC": "Xiaomi", "8C:BE:BE": "Xiaomi",
-        "00:9E:C8": "Xiaomi", "F0:B4:29": "Xiaomi",
-        "1C:1B:0D": "Huawei", "48:DB:50": "Huawei", "C8:94:BB": "Huawei",
-        "E0:24:7F": "Huawei", "24:09:95": "Huawei",
-        "64:A2:F9": "Oppo", "C0:EE:FB": "OnePlus", "94:65:2D": "OnePlus",
-        "3C:A0:67": "Vivo", "F4:8C:50": "Vivo",
-        "70:3A:CB": "Samsung", "E8:50:8B": "Samsung", "38:AA:3C": "Samsung",
-        "B4:7C:9C": "Amazon", "74:C2:46": "Amazon",
-        "00:50:56": "VMware", "08:00:27": "VirtualBox",
-        "48:8F:5A": "TP-Link", "50:C7:BF": "TP-Link",
-    }
-    key = (mac or "")[:8].upper()
-    return table.get(key, "")
+    """按 OUI 查厂商（本地库，毫秒级）。"""
+    mac = _norm_mac(mac)
+    key = mac[:8].upper()
+    if key in _OUI_CACHE:
+        return _OUI_CACHE[key]
+    name = _OUI.get(key, "")
+    _OUI_CACHE[key] = name
+    return name
 
 
 # --------------------------------------------------------------------------- #
@@ -507,28 +623,34 @@ class ArpKiller:
             out = _ps(
                 "Get-NetNeighbor -InterfaceAlias '%s' -AddressFamily IPv4 -ErrorAction SilentlyContinue | "
                 "Where-Object {$_.State -ne 'Unreachable' -and $_.LinkLayerAddress -ne '00-00-00-00-00-00'} | "
-                "ForEach-Object { \"$($_.IPAddress)|$($_.LinkLayerAddress)\" }" % self.adapter.name
+                "ForEach-Object { \"$($_.IPAddress)|$($_.LinkLayerAddress)|$($_.State)\" }" % self.adapter.name
             )
             for line in out.splitlines():
                 line = line.strip()
                 if "|" not in line:
                     continue
-                ip, mac = line.split("|", 1)
+                parts = line.split("|")
+                ip, mac = parts[0], parts[1]
+                state = parts[2] if len(parts) > 2 else ""
                 mac = _norm_mac(mac)
                 if not mac or mac == "ff:ff:ff:ff:ff:ff" or mac.startswith("01:00:5e"):
                     continue
                 if ip in ("255.255.255.255",) or ip.startswith("224.") or ip.startswith("239."):
                     continue
                 devices[ip] = Device(ip=ip, mac=mac, vendor=_vendor(mac),
-                                     last_seen=time.time())
+                                     last_seen=time.time(), state=state)
         else:
             out = _ps("ip neigh show dev %s" % self.adapter.name)
             for line in out.splitlines():
                 parts = line.split()
                 if len(parts) >= 5 and parts[2] == "lladdr":
                     devices[parts[0]] = Device(ip=parts[0], mac=_norm_mac(parts[4]),
-                                               vendor=_vendor(parts[4]))
+                                               vendor=_vendor(parts[4]),
+                                               state=parts[-1] if parts else "")
         self_mac = _norm_mac(self.adapter.mac)
+        gw_mac = ""
+        if self.gateway and self.gateway in devices:
+            gw_mac = devices[self.gateway].mac.lower()
         for d in devices.values():
             if d.ip == self.gateway:
                 d.hostname = "网关/路由器"
@@ -536,6 +658,8 @@ class ArpKiller:
                 d.hostname = "本机"
             else:
                 d.hostname = ""   # 不做在线 DNS 反查，避免 Windows 上每台卡数秒
+            if gw_mac and d.ip != self.gateway and d.mac.lower() == gw_mac:
+                d.is_proxy_arp = True
         self.log(f"邻居表只读扫描：{len(devices)} 台（未发送任何数据包）。")
         return sorted(devices.values(), key=lambda x: ipaddress.IPv4Address(x.ip))
 
@@ -584,11 +708,16 @@ class ArpKiller:
                     ip=self.gateway, mac=gmac, vendor=_vendor(gmac),
                     hostname="网关/路由器", last_seen=time.time(),
                 )
+        gw_mac = ""
+        if self.gateway and self.gateway in devices:
+            gw_mac = devices[self.gateway].mac.lower()
         for d in devices.values():
             if d.ip == self.gateway:
                 d.hostname = "网关/路由器"
             elif not d.hostname:
                 d.hostname = ""   # 不阻塞式反查 DNS
+            if gw_mac and d.ip != self.gateway and d.mac.lower() == gw_mac:
+                d.is_proxy_arp = True
         self.log(f"发现 {len(devices)} 台在线设备。")
         return sorted(devices.values(), key=lambda x: ipaddress.IPv4Address(x.ip))
 
@@ -683,17 +812,24 @@ class ArpKiller:
 
     # ---- 对外 API -------------------------------------------------------- #
     def add(self, ip: str, mac: Optional[str] = None) -> str:
-        if not mac:
-            mac = self._resolve(ip)
-        if not mac:
-            raise NetError(f"无法解析 {ip} 的 MAC 地址（设备可能已离线/不在同网段）。")
-        mac = _norm_mac(mac)
-        if mac in ("ff:ff:ff:ff:ff:ff", "00:00:00:00:00:00"):
-            raise NetError(f"{ip} 的 MAC 非法：{mac}")
         if ip == self.adapter.ip:
             raise NetError("不能把自己设为断网目标。")
         if ip == self.gateway:
             raise NetError("不能把网关设为断网目标（会把自己断网）。")
+        if not mac:
+            mac = self._resolve(ip)
+        if not mac:
+            if self.broadcast:
+                # 广播毒化不需要目标真实 MAC（帧按广播发送），用占位即可
+                mac = "ff:ff:ff:ff:ff:ff"
+            else:
+                raise NetError(
+                    f"无法解析 {ip} 的 MAC 地址（设备可能已离线/不在同网段）。\n"
+                    "如果该网络是代理ARP/客户端隔离，请保持『广播模式』勾选后再试。"
+                )
+        mac = _norm_mac(mac)
+        if not self.broadcast and mac in ("ff:ff:ff:ff:ff:ff", "00:00:00:00:00:00"):
+            raise NetError(f"{ip} 的 MAC 非法：{mac}")
         self.targets[ip] = mac
         return mac
 

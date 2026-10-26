@@ -42,13 +42,38 @@ YELLOW = "#ffc857"
 CYAN = "#5ac8fa"
 
 
+def _enable_dpi_awareness() -> None:
+    """让 Tk 自己感知高 DPI，避免 Windows 缩放导致的模糊。"""
+    if os.name != "nt":
+        return
+    try:
+        import ctypes
+        try:
+            ctypes.windll.shcore.SetProcessDpiAwareness(2)   # Per-Monitor
+        except Exception:
+            ctypes.windll.user32.SetProcessDPIAware()
+    except Exception:
+        pass
+
+
 class App(tk.Tk):
     def __init__(self) -> None:
+        _enable_dpi_awareness()
         super().__init__()
+        # 高 DPI 适配：scaling 让字体清晰，窗口尺寸按缩放放大
+        try:
+            dpi = float(self.winfo_fpixels("1i"))
+        except Exception:
+            dpi = 96.0
+        self._scale = max(1.0, dpi / 96.0)
+        try:
+            self.tk.call("tk", "scaling", dpi / 72.0)
+        except tk.TclError:
+            pass
         self.title("NetKill · 室友戒网瘾 · 一键断网")
-        self.minsize(820, 600)
+        self.minsize(int(820 * self._scale), int(600 * self._scale))
         self.configure(bg=BG)
-        self._center_window(900, 700)
+        self._center_window(int(900 * self._scale), int(700 * self._scale))
         # 启动时置顶闪一下，确保用户看得到（尤其被其它窗口压住时）
         self.after(50, self._flash_on_top)
 
@@ -59,6 +84,8 @@ class App(tk.Tk):
         self.scan_thread: threading.Thread | None = None
         self.deadline: float | None = None
         self._pump_id = None
+        self._last_devices: list = []
+        self._last_adapter = None
 
         self._build_style()
         self._build_ui()
@@ -69,6 +96,9 @@ class App(tk.Tk):
     def _center_window(self, w: int, h: int) -> None:
         sw = self.winfo_screenwidth()
         sh = self.winfo_screenheight()
+        # 不超过屏幕可用的 92%，避免高 DPI 下窗口超出屏幕
+        w = min(w, int(sw * 0.92))
+        h = min(h, int(sh * 0.92))
         x = max(0, (sw - w) // 2)
         y = max(0, (sh - h) // 2 - 20)
         self.geometry(f"{w}x{h}+{x}+{y}")
@@ -139,9 +169,20 @@ class App(tk.Tk):
         st.configure("Danger.TButton", font=("Microsoft YaHei UI", 10, "bold"),
                      padding=(14, 8), background="#c8382f", foreground="white")
         st.map("Danger.TButton", background=[("active", "#e0483e")])
+        # 主操作按钮（更大更醒目）
+        st.configure("BigDanger.TButton", font=("Microsoft YaHei UI", 13, "bold"),
+                     padding=(34, 16), background="#c8382f", foreground="white")
+        st.map("BigDanger.TButton",
+               background=[("active", "#e0483e"), ("disabled", "#5a2a28")],
+               foreground=[("disabled", "#c9a3a0")])
+        st.configure("BigAccent.TButton", font=("Microsoft YaHei UI", 12, "bold"),
+                     padding=(30, 15), background="#2f6feb", foreground="white")
+        st.map("BigAccent.TButton",
+               background=[("active", "#3b7bf5"), ("disabled", "#2a3550")],
+               foreground=[("disabled", "#8ea3c2")])
         st.configure("Treeview", background=PANEL, fieldbackground=PANEL,
-                     foreground=FG, rowheight=26, borderwidth=0,
-                     font=("Consolas", 9))
+                     foreground=FG, rowheight=int(26 * self._scale), borderwidth=0,
+                     font=("Microsoft YaHei UI", 9))
         st.configure("Treeview.Heading", background="#242838", foreground=FG,
                      font=("Microsoft YaHei UI", 9, "bold"))
         st.map("Treeview", background=[("selected", "#2f6feb")])
@@ -177,11 +218,12 @@ class App(tk.Tk):
         self.iface_box = ttk.Combobox(bar, textvariable=self.iface_var, state="readonly", width=58)
         self.iface_box.pack(side="left", padx=(0, 8))
         ttk.Button(bar, text="刷新网卡", command=self.refresh_adapters).pack(side="left")
+        # 主按钮默认用只读扫描（不发包、校园网最稳）
         self.scan_btn = ttk.Button(bar, text="扫描室友设备", style="Accent.TButton",
-                                   command=lambda: self.scan(passive=False))
+                                   command=lambda: self.scan(passive=True))
         self.scan_btn.pack(side="right")
-        self.passive_btn = ttk.Button(bar, text="只读扫描（不发包）",
-                                      command=lambda: self.scan(passive=True))
+        self.passive_btn = ttk.Button(bar, text="主动扫描（会发包）",
+                                      command=lambda: self.scan(passive=False))
         self.passive_btn.pack(side="right", padx=(0, 8))
 
         # 设备表
@@ -203,7 +245,10 @@ class App(tk.Tk):
         self.tree.pack(side="left", fill="both", expand=True)
         sb.pack(side="right", fill="y")
         self.tree.bind("<<TreeviewSelect>>", self._on_pick)
+        self.tree.bind("<Button-3>", self._on_right_click)
+        self.tree.bind("<Double-1>", lambda e: self._show_details())
         self.tree.tag_configure("gw", foreground=YELLOW)
+        self.tree.tag_configure("proxy", foreground=YELLOW)
         self.tree.tag_configure("self", foreground=MUTED)
         self.tree.tag_configure("target", foreground=RED)
 
@@ -229,16 +274,16 @@ class App(tk.Tk):
         self._on_duration_change()
 
         btns = ttk.Frame(root)
-        btns.pack(fill="x", pady=(4, 4))
-        self.start_btn = ttk.Button(btns, text="⚡ 一键断网", style="Danger.TButton",
+        btns.pack(fill="x", pady=(6, 6))
+        self.start_btn = ttk.Button(btns, text="⚡ 一键断网", style="BigDanger.TButton",
                                     command=self.start_attack)
         self.start_btn.pack(side="left")
-        self.stop_btn = ttk.Button(btns, text="■ 恢复网络", style="Accent.TButton",
+        self.stop_btn = ttk.Button(btns, text="■ 恢复网络", style="BigAccent.TButton",
                                    command=self.stop_attack, state="disabled")
-        self.stop_btn.pack(side="left", padx=8)
+        self.stop_btn.pack(side="left", padx=(14, 8))
         self.status_var = tk.StringVar(value="就绪")
         ttk.Label(btns, textvariable=self.status_var, foreground=CYAN,
-                  background=BG, font=("Microsoft YaHei UI", 9, "bold")).pack(side="right")
+                  background=BG, font=("Microsoft YaHei UI", 11, "bold")).pack(side="right")
 
         # 选项单独一行，避免和按钮挤在一起
         opts = ttk.Frame(root)
@@ -272,24 +317,32 @@ class App(tk.Tk):
     def put_log(self, line: str) -> None:
         self.ui_q.put(("log", line))
 
-    def _apply_log(self, line: str) -> None:
+    def _apply_log(self, lines) -> None:
+        """批量写入日志：一次 insert 少一次重绘，界面更流畅。"""
+        if isinstance(lines, str):
+            lines = [lines]
+        if not lines:
+            return
         self.log.configure(state="normal")
-        self.log.insert("end", line + "\n")
+        self.log.insert("end", "\n".join(lines) + "\n")
         self.log.see("end")
-        if int(self.log.index("end-1c").split(".")[0]) > 600:
-            self.log.delete("1.0", "200.0")
+        if int(self.log.index("end-1c").split(".")[0]) > 800:
+            self.log.delete("1.0", "300.0")
         self.log.configure(state="disabled")
 
     def _pump(self) -> None:
+        logs = []
         try:
             while True:
                 kind, payload = self.ui_q.get_nowait()
                 if kind == "log":
-                    self._apply_log(payload)
+                    logs.append(payload)
                 elif kind == "adapters":
                     self._apply_adapters(payload)
                 elif kind == "scan_done":
                     self._fill_devices(payload)
+                elif kind == "hosts":
+                    self._apply_hosts(payload)
                 elif kind == "started":
                     self.status_var.set("● 限速中" if self.forward_var.get() else "● 断网中")
                     self.start_btn.configure(state="disabled")
@@ -302,7 +355,7 @@ class App(tk.Tk):
                     self.deadline = None
                 elif kind == "warning":
                     # 绝不在事件泵里弹模态框：弹窗被窗口挡住时 Tk 会整体卡死
-                    self._apply_log(f"[警告] {payload}")
+                    logs.append(f"[警告] {payload}")
         except queue.Empty:
             pass
         except Exception as e:      # 单条消息出错不能拖死整个 UI 泵
@@ -312,6 +365,8 @@ class App(tk.Tk):
                 pass
         # 倒计时显示
         try:
+            if logs:
+                self._apply_log(logs)
             if self.deadline:
                 left = int(self.deadline - time.time())
                 if left > 0:
@@ -368,8 +423,15 @@ class App(tk.Tk):
         return self.adapters[idx]
 
     def scan(self, passive: bool = False) -> None:
+        # 上一次扫描若卡死（>20s），自动重置，保证点击永远有反馈
         if self.scan_thread and self.scan_thread.is_alive():
-            return
+            waited = time.time() - getattr(self, "_scan_start", 0)
+            if waited < 20:
+                self.put_log(f"[扫描] 上一次扫描仍在进行（已 {waited:.0f} 秒），请稍等…")
+                return
+            self.put_log("[扫描] 检测到上次扫描卡住，已强制重置，重新开始。")
+            self.scan_thread = None
+        self._scan_start = time.time()
         try:
             ad = self.selected_adapter()
         except NetError as e:
@@ -377,10 +439,9 @@ class App(tk.Tk):
             return
         if not passive and not can_send_packets():
             messagebox.showerror("NetKill", "主动扫描需要发包权限（管理员或允许用户模式的 Npcap）。\n"
-                                           "可以先点『只读扫描』，不需要任何权限。")
+                                           "用『扫描室友设备』即可，它只读、不需要任何权限。")
             return
-        self.scan_btn.configure(state="disabled")
-        self.passive_btn.configure(state="disabled")
+        self._set_scanning_ui(True)
         mode = "只读邻居表（不发包）" if passive else "主动 ARP 扫描"
         self.put_log(f"[扫描] {mode}，网卡 {ad.name} …")
         # 看门狗：15 秒内没结果就强制恢复按钮，避免看起来“卡死”
@@ -401,32 +462,66 @@ class App(tk.Tk):
         self.scan_thread.start()
         self.after(15000, lambda: self._scan_watchdog(seq))
 
+    def _set_scanning_ui(self, scanning: bool) -> None:
+        """扫描中：主扫描按钮变成『取消扫描』；结束后恢复原样。"""
+        if scanning:
+            self.scan_btn.configure(text="■ 取消扫描", command=self._cancel_scan,
+                                    state="normal")
+            self.passive_btn.configure(state="disabled")
+        else:
+            self.scan_btn.configure(text="扫描室友设备",
+                                    command=lambda: self.scan(passive=True),
+                                    state="normal")
+            self.passive_btn.configure(state="normal")
+
+    def _scan_finished_ui(self) -> None:
+        """扫描结束/取消后统一恢复扫描栏状态。"""
+        self._set_scanning_ui(False)
+
+    def _cancel_scan(self) -> None:
+        """取消扫描：丢弃本次结果，立即恢复可用状态。"""
+        self._scan_seq = getattr(self, "_scan_seq", 0) + 1
+        self.scan_thread = None
+        self._scan_finished_ui()
+        self.put_log("[扫描] 已取消。")
+
     def _scan_watchdog(self, seq: int) -> None:
         if seq != getattr(self, "_scan_seq", 0):
             return
         if self.scan_thread and self.scan_thread.is_alive():
             self.put_log("[超时] 扫描 15 秒未返回，已强制恢复按钮。可改用『只读扫描』。")
-            self.scan_btn.configure(state="normal")
-            self.passive_btn.configure(state="normal")
+            self._scan_finished_ui()
 
     def _fill_devices(self, payload) -> None:
         ad, devs, passive, seq = payload if len(payload) == 4 else (*payload, False, 0)
         if seq and seq != getattr(self, "_scan_seq", 0):
             return
-        self.scan_btn.configure(state="normal")
-        self.passive_btn.configure(state="normal")
+        self._scan_finished_ui()
         for item in self.tree.get_children():
             self.tree.delete(item)
+        self._last_devices = list(devs)
+        self._last_adapter = ad
+        gw_mac = ""
+        for d in devs:
+            if d.ip == ad.gateway:
+                gw_mac = (d.mac or "").lower()
+        proxy_arp = 0
         for d in devs:
             if d.ip == ad.ip:
                 tag, state = "self", "本机（禁止）"
             elif d.ip == ad.gateway:
                 tag, state = "gw", "网关（禁止）"
+            elif gw_mac and d.mac.lower() == gw_mac:
+                tag, state = "proxy", "代理ARP(用广播)"
+                proxy_arp += 1
             else:
                 tag, state = "", "可断网"
             name = d.hostname or d.vendor or "-"
             self.tree.insert("", "end", iid=d.ip,
                              values=(d.ip, d.mac, name, state), tags=(tag,))
+        if proxy_arp:
+            self.put_log(f"[提示] {proxy_arp} 台设备的 MAC 与网关相同（代理ARP/客户端隔离）。")
+            self.put_log("[提示] 这类设备请保持『广播模式』勾选，单播对它无效。")
         if not devs:
             if passive:
                 self.put_log("[扫描] 邻居表为空：先让室友设备产生一点流量（开网页/刷视频），再点只读扫描。")
@@ -435,6 +530,119 @@ class App(tk.Tk):
                 self.put_log("[建议] 改用『只读扫描』——它不发包、不需要回应，能直接列出邻居设备。")
         else:
             self.put_log(f"[扫描] 完成，共 {len(devs)} 台设备（已排除本机/网关为可攻击项）。")
+            self.put_log("[提示] 右键设备可查看详细信息（主机名/厂商/状态）。")
+            self._resolve_names_async(ad, devs)
+
+    def _resolve_names_async(self, ad, devs) -> None:
+        """后台解析主机名，不阻塞界面（查不到就保留厂商/短横线）。"""
+        pend = [d for d in devs if not d.hostname
+                and d.ip not in (ad.ip, ad.gateway)]
+        if not pend:
+            return
+
+        def work():
+            try:
+                from core.arpnet import resolve_hostnames
+                resolve_hostnames(pend, workers=8, timeout=0.8)
+                ups = [(d.ip, d.hostname) for d in pend if d.hostname]
+                if ups:
+                    self.ui_q.put(("hosts", ups))
+            except Exception:
+                pass
+
+        threading.Thread(target=work, daemon=True).start()
+
+    def _apply_hosts(self, ups) -> None:
+        for ip, name in ups:
+            if not self.tree.exists(ip):
+                continue
+            vals = list(self.tree.item(ip, "values"))
+            if len(vals) >= 3 and name:
+                vals[2] = name
+                self.tree.item(ip, values=vals)
+        if ups:
+            self.put_log(f"[信息] 已解析 {len(ups)} 台设备的主机名。")
+
+    # ------------------------------------------------------------------ 右键详情
+    def _on_right_click(self, evt) -> None:
+        iid = self.tree.identify_row(evt.y)
+        if not iid:
+            return
+        self.tree.selection_set(iid)
+        menu = tk.Menu(self, tearoff=0,
+                       bg=PANEL, fg=FG, activebackground="#2f6feb",
+                       activeforeground="white", bd=0)
+        menu.add_command(label="  查看详细信息", command=self._show_details)
+        menu.add_separator()
+        menu.add_command(label="  复制 IP", command=lambda: self._copy(iid, 0))
+        menu.add_command(label="  复制 MAC 地址", command=lambda: self._copy(iid, 1))
+        try:
+            menu.tk_popup(evt.x_root, evt.y_root)
+        finally:
+            menu.grab_release()
+
+    def _copy(self, iid: str, idx: int) -> None:
+        vals = self.tree.item(iid, "values")
+        if len(vals) > idx:
+            self.clipboard_clear()
+            self.clipboard_append(str(vals[idx]))
+            self.put_log(f"[复制] {vals[idx]}")
+
+    def _show_details(self) -> None:
+        sel = self.tree.selection()
+        if not sel:
+            return
+        ip = sel[0]
+        vals = list(self.tree.item(ip, "values"))
+        dev = next((d for d in getattr(self, "_last_devices", []) if d.ip == ip), None)
+        ad = getattr(self, "_last_adapter", None)
+        win = tk.Toplevel(self)
+        win.title(f"设备详情 · {ip}")
+        win.configure(bg=BG)
+        win.geometry("520x430")
+        win.transient(self)
+        try:
+            win.grab_set()
+        except tk.TclError:
+            pass
+        pad = ttk.Frame(win, padding=18)
+        pad.pack(fill="both", expand=True)
+        ttk.Label(pad, text="设备详细信息", foreground=CYAN, background=BG,
+                  font=("Microsoft YaHei UI", 13, "bold")).pack(anchor="w", pady=(0, 12))
+        info = [
+            ("IP 地址", vals[0] if len(vals) > 0 else ip),
+            ("MAC 地址", vals[1] if len(vals) > 1 else "-"),
+            ("厂商", (dev.vendor if dev and dev.vendor else "未知（不在本地厂商库）")),
+            ("主机名", (dev.hostname if dev and dev.hostname else "未解析（网络不提供名称）")),
+            ("邻居状态", (dev.state if dev and dev.state else "未知")),
+            ("识别结果", vals[3] if len(vals) > 3 else "-"),
+        ]
+        if dev and dev.is_proxy_arp:
+            info.append(("网络类型", "代理ARP / 客户端隔离（MAC 被网关代替）"))
+        if ad and ip == ad.gateway:
+            info.append(("备注", "这是网关，不能作为断网目标"))
+        if ad and ip == ad.ip:
+            info.append(("备注", "这是本机"))
+        for k, v in info:
+            row = ttk.Frame(pad)
+            row.pack(fill="x", pady=3)
+            ttk.Label(row, text=k, width=10, style="Muted.TLabel").pack(side="left")
+            ttk.Label(row, text=str(v), wraplength=380,
+                      font=("Microsoft YaHei UI", 10)).pack(side="left")
+        hint = "建议：先选为目标 → 保持广播模式 → 1 分钟测试；" \
+               "代理ARP网络下只能用广播模式。"
+        ttk.Label(pad, text=hint, style="Muted.TLabel",
+                  wraplength=470).pack(anchor="w", pady=(14, 0))
+        btns = ttk.Frame(pad)
+        btns.pack(fill="x", pady=(16, 0))
+        ttk.Button(btns, text="复制全部信息", command=lambda: self._copy_all(win, info)).pack(side="left")
+        ttk.Button(btns, text="关闭", command=win.destroy).pack(side="right")
+
+    def _copy_all(self, win, info) -> None:
+        text = "\n".join(f"{k}: {v}" for k, v in info)
+        self.clipboard_clear()
+        self.clipboard_append(text)
+        self.put_log("[复制] 已复制设备详细信息")
 
     def _on_pick(self, _evt=None) -> None:
         sel = self.tree.selection()
@@ -505,10 +713,18 @@ class App(tk.Tk):
                 raise NetError("拒绝：目标是本机。")
             if ip == ad.gateway:
                 raise NetError("拒绝：目标是网关。")
+            # 优先使用扫描列表里已显示的 MAC，避免二次解析失败（代理ARP网络必现）
+            mac = ""
+            if self.tree.exists(ip):
+                vals = self.tree.item(ip, "values")
+                if len(vals) >= 2:
+                    mac = str(vals[1]).strip()
+                    if mac in ("-", "None", ""):
+                        mac = ""
             killer = ArpKiller(adapter=ad, forward=self.forward_var.get(),
                                broadcast=self.broadcast_var.get())
             killer.on_log = self.put_log
-            killer.add(ip)
+            killer.add(ip, mac or None)
             killer.start(background=True)
         except NetError as e:
             messagebox.showerror("NetKill", str(e))
